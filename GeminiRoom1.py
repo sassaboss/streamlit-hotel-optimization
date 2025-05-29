@@ -1,81 +1,187 @@
 import streamlit as st
 import pandas as pd
-import os
 import plotly.express as px
 import plotly.graph_objects as go
 
-# --- Pomoćna funkcija za stilizovane metrike ---
-def styled_metric_box(label, value, bg_color, text_color, help_text=None):
-    """
-    Generiše stilizovanu kutiju za metrike sa pozadinskom bojom i kontrolom fonta.
-    """
-    html_string = f"""
-    <div style="
-        background-color: {bg_color};
-        padding: 15px;
-        border-radius: 10px;
-        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-        text-align: center;
-        margin-bottom: 10px;
-        height: 100%; /* Osigurava konzistentnu visinu u kolonama */
-        display: flex;
-        flex-direction: column;
-        justify-content: space-between;
-        color: {text_color};
-    ">
-        <div style="font-size: 0.9em; font-weight: bold;">{label}</div>
-        <div style="font-size: 1.5em; font-weight: bold; margin-top: 5px;">{value}</div>
-        {f'<div style="font-size: 0.7em; color: #6c757d; margin-top: 5px;">{help_text}</div>' if help_text else ''}
-    </div>
-    """
-    st.markdown(html_string, unsafe_allow_html=True)
+# --- Optimizaciona logika izdvojena u zasebnu funkciju i keširana ---
+@st.cache_data(ttl=3600)
+def perform_allocation(total_guests, max_price_per_guest, breakfast_chosen, lunch_chosen, dinner_chosen, room_types_data, available_rooms_data, global_meal_prices_data):
+    
+    total_income_from_rooms = 0.0
+    total_income_from_meals = 0.0
+    total_accommodated_guests = 0
+    remaining_guests = total_guests
+    allocation = []
+
+    available_room_types = []
+    for r in room_types_data:
+        price_per_guest_room_only = r['price'] / r['capacity'] if r['capacity'] > 0 else float('inf')
+        
+        if price_per_guest_room_only <= max_price_per_guest:
+            temp_room_data = r.copy() 
+            available_room_types.append(temp_room_data)
+
+    if not available_room_types:
+        return allocation, total_income_from_rooms, total_income_from_meals, total_accommodated_guests, remaining_guests, "no_valid_rooms", 0.0
+
+    room_types_sorted_for_filling = sorted(
+        available_room_types,
+        key=lambda x: (x['priority'], -(x['price'] / x['capacity'])) 
+    )
+    
+    current_available_rooms = available_rooms_data.copy()
+
+    for room in room_types_sorted_for_filling:
+        if remaining_guests <= 0:
+            break
+        
+        available_for_allocation = current_available_rooms.get(room['name'], 0) 
+
+        if available_for_allocation == 0:
+            continue
+        
+        num_rooms_to_fill_fully = min(available_for_allocation, remaining_guests // room['capacity'])
+        
+        if num_rooms_to_fill_fully > 0:
+            guests_in_this_batch = num_rooms_to_fill_fully * room['capacity']
+            
+            current_room_income = num_rooms_to_fill_fully * room['price']
+            current_meal_income = 0
+            if breakfast_chosen:
+                current_meal_income += guests_in_this_batch * global_meal_prices_data['breakfast']
+            if lunch_chosen:
+                current_meal_income += guests_in_this_batch * global_meal_prices_data['lunch']
+            if dinner_chosen:
+                current_meal_income += guests_in_this_batch * global_meal_prices_data['dinner']
+            
+            allocation.append({
+                'room_type': room['name'],
+                'rooms_used': num_rooms_to_fill_fully,
+                'guests_accommodated': guests_in_this_batch,
+                'room_income': current_room_income,
+                'meal_income': current_meal_income,
+                'priority': room['priority'],
+                'room_capacity': room['capacity'] # Dodajemo kapacitet sobe za kasnije izračunavanje
+            })
+            remaining_guests -= guests_in_this_batch
+            total_income_from_rooms += current_room_income
+            total_income_from_meals += current_meal_income
+            total_accommodated_guests += guests_in_this_batch
+            current_available_rooms[room['name']] -= num_rooms_to_fill_fully
+    
+    if remaining_guests > 0:
+        room_types_sorted_for_leftovers = sorted(
+            [r for r in available_room_types if current_available_rooms.get(r['name'], 0) > 0],
+            key=lambda x: (x['priority'], -(x['price'] / x['capacity']))
+        )
+
+        for room in room_types_sorted_for_leftovers:
+            if remaining_guests <= 0:
+                break
+            
+            rooms_left_of_this_type = current_available_rooms.get(room['name'], 0)
+            if rooms_left_of_this_type > 0:
+                
+                guests_to_try_fit = min(remaining_guests, room['capacity'])
+                
+                price_per_guest_room_only_current_room = room['price'] / room['capacity'] if room['capacity'] > 0 else float('inf')
+
+                if price_per_guest_room_only_current_room <= max_price_per_guest: # Provera da li soba i dalje zadovoljava kriterijum
+                    num_rooms_to_use = 1 
+                    
+                    current_room_income = num_rooms_to_use * room['price']
+                    current_meal_income = 0
+                    if breakfast_chosen:
+                        current_meal_income += guests_to_try_fit * global_meal_prices_data['breakfast']
+                    if lunch_chosen:
+                        current_meal_income += guests_to_try_fit * global_meal_prices_data['lunch']
+                    if dinner_chosen:
+                        current_meal_income += guests_to_try_fit * global_meal_prices_data['dinner']
+                    
+                    allocation.append({
+                        'room_type': room['name'],
+                        'rooms_used': num_rooms_to_use,
+                        'guests_accommodated': guests_to_try_fit,
+                        'room_income': current_room_income,
+                        'meal_income': current_meal_income,
+                        'priority': room['priority'],
+                        'room_capacity': room['capacity'] # Dodajemo kapacitet sobe
+                    })
+                    remaining_guests -= guests_to_try_fit
+                    total_income_from_rooms += current_room_income
+                    total_income_from_meals += current_meal_income
+                    total_accommodated_guests += guests_to_try_fit
+                    current_available_rooms[room['name']] -= num_rooms_to_use
+                    
+                    if remaining_guests <= 0:
+                        break
+    
+    # Izračunavanje prosečne ostvarene cene po krevetu (samo smeštaj)
+    # Ovo se računa na osnovu SMEŠTENIH GOSTIJU, a ne ukupnog kapaciteta
+    avg_achieved_price_per_bed_room_only = 0.0
+    if total_accommodated_guests > 0:
+        avg_achieved_price_per_bed_room_only = total_income_from_rooms / total_accommodated_guests
+    
+    return allocation, total_income_from_rooms, total_income_from_meals, total_accommodated_guests, remaining_guests, "success" if remaining_guests == 0 else "partial_success", avg_achieved_price_per_bed_room_only
 
 # --- Glavna aplikacija ---
 def main():
-    # Konfiguracija stranice: širok raspored i naslov
     st.set_page_config(layout="wide", page_title="Optimizacija Gostiju po Sobama")
-    st.title("🏨 Optimizacija Rasporeda Gostiju po Sobama")
+    st.markdown("<h1 style='font-size: 48px; color: #0056b3; text-align: center;'>🏨 Optimizacija Rasporeda Gostiju po Sobama</h1>", unsafe_allow_html=True)
     st.markdown("---")
 
-    # Inicijalizacija session state varijabli
     if 'room_types' not in st.session_state:
         st.session_state.room_types = []
     if 'global_meal_prices' not in st.session_state:
-        st.session_state.global_meal_prices = {'breakfast': 0.0, 'lunch': 0.0, 'dinner': 0.0}
+        # --- PODRAZUMEVANE VREDNOSTI ZA OBROKE ---
+        st.session_state.global_meal_prices = {'breakfast': 10.0, 'lunch': 15.0, 'dinner': 20.0} 
 
-    # Predefinisane sobe (dodaju se samo jednom pri prvom pokretanju)
-    if not st.session_state.room_types:
+    if not st.session_state.room_types and 'predefined_rooms_added' not in st.session_state:
+        # --- NOVI PODACI ZA SOBE PREMA TVOJOJ TABELI ---
         predefined_rooms = [
-            {'name': 'Jednokrevetna', 'capacity': 1, 'price': 50.0, 'count': 5, 'priority': 1},
-            {'name': 'Dvokrevetna', 'capacity': 2, 'price': 80.0, 'count': 10, 'priority': 2},
-            {'name': 'Porodična', 'capacity': 4, 'price': 150.0, 'count': 3, 'priority': 3},
+            {'name': 'junr', 'capacity': 4, 'price': 180.0, 'count': 6, 'priority': 1},
+            {'name': 'exec-5', 'capacity': 5, 'price': 200.0, 'count': 1, 'priority': 3},
+            {'name': 'exec-6', 'capacity': 6, 'price': 200.0, 'count': 3, 'priority': 3},
+            {'name': 'king-2', 'capacity': 2, 'price': 110.0, 'count': 8, 'priority': 2},
+            {'name': 'king-4', 'capacity': 4, 'price': 110.0, 'count': 3, 'priority': 2},
+            {'name': 'royl-4', 'capacity': 4, 'price': 240.0, 'count': 2, 'priority': 4},
+            {'name': 'royl-6', 'capacity': 6, 'price': 240.0, 'count': 2, 'priority': 4},
+            {'name': 'twin', 'capacity': 2, 'price': 110.0, 'count': 7, 'priority': 2},
         ]
         st.session_state.room_types.extend(predefined_rooms)
-    
-    # INICIJALIZACIJA za raspoložive sobe
-    if 'available_rooms' not in st.session_state:
-        st.session_state.available_rooms = {room['name']: room['count'] for room in st.session_state.room_types}
-    
-    # --- Sidebar za globalne kontrole i navigaciju ---
+        st.session_state.predefined_rooms_added = True 
+
+    for room in st.session_state.room_types:
+        if room['name'] not in st.session_state.get('available_rooms', {}):
+            if 'available_rooms' not in st.session_state:
+                st.session_state.available_rooms = {}
+            st.session_state.available_rooms[room['name']] = room['count']
+            
+    current_room_names = {room['name'] for room in st.session_state.room_types}
+    available_room_names_in_state = list(st.session_state.get('available_rooms', {}).keys())
+
+    for room_name_in_state in available_room_names_in_state:
+        if room_name_in_state not in current_room_names:
+            del st.session_state.available_rooms[room_name_in_state]
+
+
     st.sidebar.header("Kontrole i Podešavanja")
     st.sidebar.markdown("---")
     
-    # Dugme za resetovanje svih postavki
-    if st.sidebar.button("Resetuj sve postavke"):
-        st.session_state.clear() # Briše ceo session state
-        st.rerun() # Ponovo pokreće aplikaciju
+    if st.sidebar.button("Resetuj sve postavke", key="reset_button"):
+        st.session_state.clear()
+        st.rerun()
     st.sidebar.markdown("---")
 
-    # Globalni unos broja gostiju u sidebar
+    # --- AŽURIRAN PODRAZUMEVANI BROJ GOSTIJU ---
     total_guests = st.sidebar.number_input(
         "Ukupan broj gostiju za raspored",
         min_value=1,
-        value=10,
+        value=30, # Povećan broj gostiju da bi odgovarao novoj strukturi
         step=1,
         help="Unesite ukupan broj gostiju koje treba rasporediti."
     )
     
-    # Globalni izbor obroka u sidebar
     st.sidebar.subheader("Izbor obroka za raspored")
     col_bf, col_lu, col_di = st.sidebar.columns(3)
     with col_bf:
@@ -83,16 +189,15 @@ def main():
     with col_lu:
         lunch_chosen = st.checkbox("Ručak", value=False)
     with col_di:
-        dinner_chosen = st.checkbox("Večera", value=False)
-
+        dinner_chosen = st.checkbox("Večera", value=True) # Postavljeno na True radi testiranja
     st.sidebar.markdown("---")
 
-    # Maksimalna dozvoljena cena po gostu
     st.sidebar.subheader("Kriterijumi rasporeda")
+    # --- AŽURIRANA PODRAZUMEVANA MAKSIMALNA CENA PO GOSTU ---
     max_price_per_guest = st.sidebar.number_input(
         "Maksimalna dozvoljena cena po gostu (samo soba, €)",
         min_value=0.0,
-        value=st.session_state.get('max_price_per_guest', 80.0),
+        value=st.session_state.get('max_price_per_guest', 60.0), # Prilagođeno novim cenama soba
         step=5.0,
         help="Cena smeštaja po gostu (bez obroka) ne sme preći ovu vrednost. Ovo je filter za izbor soba."
     )
@@ -100,12 +205,10 @@ def main():
     
     st.sidebar.markdown("---")
 
-    # Dugme za pokretanje optimizacije
-    allocation_button = st.sidebar.button("Pokreni Optimizaciju Rasporeda", type="primary", use_container_width=True)
+    allocation_button = st.sidebar.button("Pokreni Optimizaciju Rasporeda", type="primary", use_container_width=True, key="run_optimization_button")
 
     st.sidebar.markdown("---")
 
-    # --- Glavni sadržaj sa tabovima za raspoložive sobe i cene obroka ---
     tab_available_rooms, tab_meal_settings = st.tabs(["🔢 Trenutno Raspoložive Sobe", "🍽️ Postavke Cena Obroka"])
 
     with tab_available_rooms:
@@ -117,15 +220,15 @@ def main():
         
         for i, room in enumerate(st.session_state.room_types):
             with cols[i % num_columns]:
-                current_available = st.session_state.available_rooms.get(room['name'], room['count'])
-                if current_available > room['count']:
-                    current_available = room['count']
+                current_available_for_input = st.session_state.available_rooms.get(room['name'], room['count'])
+                if current_available_for_input > room['count']:
+                     current_available_for_input = room['count']
 
                 new_available = st.number_input(
                     label=f"**{room['name']}** (ukupno: {room['count']})",
                     min_value=0,
                     max_value=room['count'],
-                    value=current_available,
+                    value=current_available_for_input,
                     step=1,
                     key=f"available_{room['name']}"
                 )
@@ -154,9 +257,6 @@ def main():
 
     st.markdown("---")
 
-    # --- Ostatak glavnog sadržaja (ispod tabova) ---
-
-    # Sekcija za dodavanje tipova soba i prioritet
     st.header("🛠️ Upravljanje Tipovima Soba i Prioritetima")
     st.write("Dodajte nove tipove soba ili izmenite/obrišite postojeće.")
     
@@ -174,7 +274,8 @@ def main():
             with col4:
                 room_count = st.number_input("Ukupan broj soba ovog tipa", min_value=1, step=1, key="add_room_count")
             with col5:
-                priority = st.number_input("Prioritet (1 = najviši prioritet)", min_value=1, step=1, value=3, 
+                current_max_priority = max([r['priority'] for r in st.session_state.room_types]) if st.session_state.room_types else 0
+                priority = st.number_input("Prioritet (1 = najviši prioritet)", min_value=1, step=1, value=current_max_priority + 1 if current_max_priority > 0 else 1, 
                                            help="Sobe sa nižim brojem prioriteta se pune prve.", key="add_priority")
             
             st.info("Cene obroka za ovaj tip sobe će koristiti globalne postavke.")
@@ -210,7 +311,7 @@ def main():
         
         st.markdown("---")
         st.subheader("Izmena i brisanje soba")
-        st.write("Kliknite na tip sobe ispod da biste ga izmenili ili obrisali.")
+        st.write("Kliknite na tip sobe ispod da biste ga izmenili ili obbrisali.")
         
         for i, room in enumerate(st.session_state.room_types[:]): 
             with st.expander(f"⚙️ {room['name']} (Kapacitet: {room['capacity']}, Cena: {room['price']}€, Prioritet: {room['priority']})"):
@@ -229,7 +330,7 @@ def main():
                     with col5:
                         new_priority = st.number_input("Prioritet", value=room.get('priority', 3), min_value=1, step=1, key=f"edit_priority_{i}")
                     
-                    st.info(f"Cene obroka za ovaj tip sobe koriste globalne postavke: Doručak {st.session_state.global_meal_prices['breakfast']}€, Ručak {st.session_state.global_meal_prices['lunch']}€, Večera {st.session_state.global_meal_prices['dinner']}€.")
+                    st.info(f"Cene obroka za ovaj tip sobe koriste globalne postavke: Doručak {st.session_state.global_meal_prices['breakfast']:.2f}€, Ručak {st.session_state.global_meal_prices['lunch']:.2f}€, Večera {st.session_state.global_meal_prices['dinner']:.2f}€.")
                     
                     update_submitted = st.form_submit_button("Ažuriraj sobu", type="primary")
                     if update_submitted:
@@ -243,6 +344,9 @@ def main():
                                 'count': int(new_count),
                                 'priority': int(new_priority),
                             }
+                            if new_name != room['name']:
+                                if room['name'] in st.session_state.available_rooms:
+                                    st.session_state.available_rooms[new_name] = st.session_state.available_rooms.pop(room['name'])
                             st.session_state.available_rooms[new_name] = int(new_count)
                             st.success(f"Tip sobe **{new_name}** ažuriran.")
                             st.rerun()
@@ -264,19 +368,8 @@ def main():
 
     st.markdown("---")
 
-    # Sekcija za unos gostiju i optimizaciju
     st.header("📊 Optimizacija Rasporeda i Izveštaji")
     
-    # Inicijalizacija varijabli za statistiku
-    total_income_from_rooms = 0.0
-    total_income_from_meals = 0.0
-    total_accommodated_guests = 0
-    total_rooms_used = 0
-    avg_price_per_room = 0.0
-    total_overall_income = 0.0
-    avg_price_per_guest = 0.0
-    
-    # Izračunavanje globalnih kapaciteta i broja soba (uvek dostupno)
     total_hotel_capacity = sum(room['capacity'] * room['count'] for room in st.session_state.room_types)
     current_available_capacity = 0
     for room_type_data in st.session_state.room_types:
@@ -285,7 +378,6 @@ def main():
     total_physical_rooms = sum(room['count'] for room in st.session_state.room_types)
 
 
-    # Glavni blok za prikaz rezultata, aktivira se pritiskom na dugme u sidebaru
     if allocation_button:
         if not st.session_state.room_types:
             st.error("Nema definisanih tipova soba. Molimo dodajte ih u sekciji 'Upravljanje Tipovima Soba'.")
@@ -294,133 +386,27 @@ def main():
             st.error("Broj gostiju mora biti veći od 0.")
             st.stop()
         
-        # --- Logika optimizacije rasporeda (premeštena ovde) ---
-        available_room_types = []
-        for r in st.session_state.room_types:
-            price_per_guest_room_only = r['price'] / r['capacity'] if r['capacity'] > 0 else float('inf')
-            
-            if price_per_guest_room_only <= max_price_per_guest:
-                temp_room_data = r.copy() 
-                available_room_types.append(temp_room_data)
-
-        if not available_room_types:
-            st.warning(f"Nijedan tip sobe ne ispunjava uslov maksimalne dozvoljene cene samo za smeštaj po gostu ({max_price_per_guest}€). Pokušajte da povećate dozvoljenu cenu za smeštaj.")
-            st.info("Nema alokacije za zadate parametre. Nije moguće smestiti goste ili nijedna soba ne zadovoljava kriterijume.")
-            st.stop()
-
-        room_types_sorted_for_filling = sorted(
-            available_room_types,
-            key=lambda x: (x['priority'], -(x['price'] / x['capacity'])) 
+        allocation, total_income_from_rooms, total_income_from_meals, total_accommodated_guests, remaining_guests, status_message, avg_achieved_price_per_bed_room_only = perform_allocation(
+            total_guests, max_price_per_guest, breakfast_chosen, lunch_chosen, dinner_chosen, 
+            st.session_state.room_types, st.session_state.available_rooms, st.session_state.global_meal_prices
         )
-        
-        remaining_guests = total_guests
-        allocation = []
-        total_income_from_rooms = 0.0
-        total_income_from_meals = 0.0
-        total_accommodated_guests = 0
-        
-        current_available_rooms = st.session_state.available_rooms.copy()
 
-        for room in room_types_sorted_for_filling:
-            if remaining_guests <= 0:
-                break
-            
-            available_for_allocation = current_available_rooms.get(room['name'], 0) 
-
-            if available_for_allocation == 0:
-                continue
-            
-            num_rooms_to_fill_fully = min(available_for_allocation, remaining_guests // room['capacity'])
-            
-            if num_rooms_to_fill_fully > 0:
-                guests_in_this_batch = num_rooms_to_fill_fully * room['capacity']
-                
-                current_room_income = num_rooms_to_fill_fully * room['price']
-                current_meal_income = 0
-                if breakfast_chosen:
-                    current_meal_income += guests_in_this_batch * st.session_state.global_meal_prices['breakfast']
-                if lunch_chosen:
-                    current_meal_income += guests_in_this_batch * st.session_state.global_meal_prices['lunch']
-                if dinner_chosen:
-                    current_meal_income += guests_in_this_batch * st.session_state.global_meal_prices['dinner']
-                
-                allocation.append({
-                    'room_type': room['name'],
-                    'rooms_used': num_rooms_to_fill_fully,
-                    'guests_accommodated': guests_in_this_batch,
-                    'room_income': current_room_income,
-                    'meal_income': current_meal_income,
-                    'priority': room['priority']
-                })
-                remaining_guests -= guests_in_this_batch
-                total_income_from_rooms += current_room_income
-                total_income_from_meals += current_meal_income
-                total_accommodated_guests += guests_in_this_batch
-                current_available_rooms[room['name']] -= num_rooms_to_fill_fully
-        
-        if remaining_guests > 0:
-            st.info(f"Pokušavam da smestim preostalih {remaining_guests} gostiju u raspoložive sobe.")
-            
-            room_types_sorted_for_leftovers = sorted(
-                [r for r in available_room_types if current_available_rooms.get(r['name'], 0) > 0],
-                key=lambda x: (x['priority'], -(x['price'] / x['capacity']))
-            )
-
-            for room in room_types_sorted_for_leftovers:
-                if remaining_guests <= 0:
-                    break
-                
-                rooms_left_of_this_type = current_available_rooms.get(room['name'], 0)
-                if rooms_left_of_this_type > 0:
-                    
-                    guests_to_try_fit = min(remaining_guests, room['capacity'])
-                    
-                    price_per_guest_room_only = room['price'] / room['capacity'] if room['capacity'] > 0 else float('inf')
-
-                    if price_per_guest_room_only <= max_price_per_guest:
-                        num_rooms_to_use = 1 
-                        
-                        current_room_income = num_rooms_to_use * room['price']
-                        current_meal_income = 0
-                        if breakfast_chosen:
-                            current_meal_income += guests_to_try_fit * st.session_state.global_meal_prices['breakfast']
-                        if lunch_chosen:
-                            current_meal_income += guests_to_try_fit * st.session_state.global_meal_prices['lunch']
-                        if dinner_chosen:
-                            current_meal_income += guests_to_try_fit * st.session_state.global_meal_prices['dinner']
-                        
-                        allocation.append({
-                            'room_type': room['name'],
-                            'rooms_used': num_rooms_to_use,
-                            'guests_accommodated': guests_to_try_fit,
-                            'room_income': current_room_income,
-                            'meal_income': current_meal_income,
-                            'priority': room['priority']
-                        })
-                        remaining_guests -= guests_to_try_fit
-                        total_income_from_rooms += current_room_income
-                        total_income_from_meals += current_meal_income
-                        total_accommodated_guests += guests_to_try_fit
-                        current_available_rooms[room['name']] -= num_rooms_to_use
-                        
-                        if remaining_guests <= 0:
-                            break
-                    
-        # --- Prikaz poruka o uspehu/neuspehu alokacije ---
-        if remaining_guests > 0:
+        if status_message == "no_valid_rooms":
+            st.warning(f"Nijedan tip sobe ne ispunjava uslov maksimalne dozvoljene cene samo za smeštaj po gostu ({max_price_per_guest:.2f}€). Pokušajte da povećate dozvoljenu cenu za smeštaj.")
+            st.info("Nema alokacije za zadate parametre. Nije moguće smestiti goste ili nijedna soba ne zadovoljava kriterijume.")
+        elif remaining_guests > 0:
             st.warning(f"Nije moguće smestiti svih **{total_guests}** gostiju sa datim kriterijumima. Preostalo je **{remaining_guests}** gostiju. Pokušajte da povećate broj soba, dozvoljenu cenu smeštaja po gostu ili smanjite izbor obroka.")
         else:
             st.success(f"Svi gosti su uspešno raspoređeni! 🎉")
         
-        # Izračunavanje izvedenih statistika nakon alokacije
         total_overall_income = total_income_from_rooms + total_income_from_meals
-        total_rooms_used = sum(item['rooms_used'] for item in allocation)
+        total_rooms_used = sum(item['rooms_used'] for item in allocation) if allocation else 0
         avg_price_per_room = total_income_from_rooms / total_rooms_used if total_rooms_used > 0 else 0.0
         avg_price_per_guest = total_overall_income / total_accommodated_guests if total_accommodated_guests > 0 else 0.0
 
 
         if allocation:
-            st.subheader("Detaljan raspored:") # Sada je ovaj subheader ovde
+            st.subheader("Detaljan raspored:")
             df = pd.DataFrame(allocation)
             df['total_income'] = df['room_income'] + df['meal_income']
             df = df.sort_values(by='priority')
@@ -429,45 +415,57 @@ def main():
             st.dataframe(df_display, use_container_width=True, hide_index=True)
             
             st.markdown("---")
-            st.subheader("Sumarni pregled:")
+            st.subheader("Sumarni pregled ključnih metrika:")
             
-            # --- Prikaz metrika u stilizovanim kutijama ---
-            GREY_BG = "#E9ECEF"
-            DARK_TEXT = "#343A40"
+            # --- Kreiranje DataFrame za metrike ---
+            metrics_data = {
+                "Metrika": [
+                    "Ukupan Broj Gostiju (za raspored)",
+                    "Ukupan Kapacitet Hotela (kreveta)",
+                    "Ukupan Prihod (Sobe)",
+                    "Ukupan Prihod (Obroci)",
+                    "Ukupan Prihod Hotela", 
+                    "Prosečna Cena po Gostu (uklj. hranu)",
+                    "Prosečna Cena po Zauzetoj Sobi",
+                    "Prosečna ostvarena cena po krevetu (samo smeštaj)", # Novi KPI
+                    "Kapacitet Raspoloživih Kreveta (trenutno)",
+                    "Ukupan Broj Smeštenih Gostiju",
+                    "Ukupan Broj Fizičkih Soba u Hotelu"
+                ],
+                "Vrednost": [
+                    f"{total_guests}",
+                    f"{total_hotel_capacity}",
+                    f"{total_income_from_rooms:.2f} €",
+                    f"{total_income_from_meals:.2f} €",
+                    f"{total_overall_income:.2f} €", 
+                    f"{avg_price_per_guest:.2f} €",
+                    f"{avg_price_per_room:.2f} €",
+                    f"{avg_achieved_price_per_bed_room_only:.2f} €", # Vrednost za novi KPI
+                    f"{current_available_capacity}",
+                    f"{total_accommodated_guests}",
+                    f"{total_physical_rooms}"
+                ]
+            }
+            metrics_df = pd.DataFrame(metrics_data)
 
-            st.markdown("#### Ključne metrike rasporeda")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                styled_metric_box("Ukupan Broj Gostiju (za raspored)", total_guests, GREY_BG, DARK_TEXT, "Broj gostiju koji se raspoređuju")
-            with col2:
-                styled_metric_box("Ukupan Kapacitet Hotela (kreveta)", total_hotel_capacity, GREY_BG, DARK_TEXT, "Ukupan broj kreveta u hotelu")
-            with col3:
-                styled_metric_box("Ukupan Prihod (Sobe)", f"{total_income_from_rooms:.2f} €", GREY_BG, DARK_TEXT, "Prihod samo od smeštaja")
-            with col4:
-                styled_metric_box("Ukupan Prihod (Obroci)", f"{total_income_from_meals:.2f} €", GREY_BG, DARK_TEXT, "Prihod od odabranih obroka")
-            
-            st.markdown("#### Finansijski pokazatelji")
-            col5, col6, col7 = st.columns(3)
-            with col5:
-                styled_metric_box("Ukupan Prihod Hotela", f"**{total_overall_income:.2f} €**", "#D1ECF1", "#17A2B8", "Zbir prihoda od soba i obroka")
-            with col6:
-                styled_metric_box("Prosečna Cena po Gostu (uklj. hranu)", f"{avg_price_per_guest:.2f} €", GREY_BG, DARK_TEXT, "Prosečan prihod po smeštenom gostu (smeštaj + obroci)")
-            with col7:
-                styled_metric_box("Prosečna Cena po Zauzetoj Sobi", f"{avg_price_per_room:.2f} €", GREY_BG, DARK_TEXT, "Prosečan prihod po zauzetoj sobi")
+            # --- Stilizovanje tabele: Zelena za ukupan prihod, svetložuta za prosečnu cenu po zauzetoj sobi ---
+            def highlight_kpis(row):
+                styles = [''] * len(row)
+                if row['Metrika'] == "Ukupan Prihod Hotela":
+                    styles = ['background-color: #D4EDDA; font-weight: bold; color: #155724;'] * len(row) # Zelena pozadina, bold, tamniji tekst
+                elif row['Metrika'] == "Prosečna Cena po Zauzetoj Sobi":
+                    styles = ['background-color: #FFF3CD;'] * len(row) # Svetložuta pozadina
+                return styles
 
-            st.markdown("#### Kapacitet i iskorišćenost")
-            col_cap1, col_cap2, col_cap3 = st.columns(3)
-            with col_cap1:
-                styled_metric_box("Kapacitet Raspoloživih Kreveta (trenutno)", current_available_capacity, GREY_BG, DARK_TEXT, "Broj dostupnih kreveta pre optimizacije")
-            with col_cap2:
-                styled_metric_box("Ukupan Broj Smeštenih Gostiju", total_accommodated_guests, GREY_BG, DARK_TEXT, "Broj gostiju koji su uspešno smešteni")
-            with col_cap3:
-                styled_metric_box("Ukupan Broj Fizičkih Soba u Hotelu", total_physical_rooms, GREY_BG, DARK_TEXT, "Ukupan broj svih soba u hotelu")
+            st.dataframe(
+                metrics_df.style.apply(highlight_kpis, axis=1),
+                use_container_width=True,
+                hide_index=True
+            )
             
             st.markdown("---")
             st.subheader("Vizuelni prikaz rezultata:")
 
-            # --- Grafikoni ---
             chart_col1, chart_col2 = st.columns(2)
 
             with chart_col1:
@@ -555,10 +553,10 @@ def main():
                 )
                 st.plotly_chart(fig_capacity_bar, use_container_width=True)
 
-        else: # Ova poruka se prikazuje ako je dugme pritisnuto, ali nema alokacije
+        else:
             st.info("Nema alokacije za zadate parametre. Nije moguće smestiti goste ili nijedna soba ne zadovoljava kriterijume.")
     
-    else: # Ova poruka se prikazuje pre nego što se dugme pritisne
+    else:
         st.info("Unesite broj gostiju (u sidebaru), podesite kriterijume i kliknite 'Pokreni Optimizaciju Rasporeda' (u sidebaru) da biste dobili predlog.")
 
 if __name__ == "__main__":
